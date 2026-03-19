@@ -20,7 +20,6 @@ from threading import Lock
 from typing import Any, TypeAlias
 
 import mlx.core as mx
-import numpy as np
 import torch
 from mlx_lm import load as mlx_lm_load
 from mlx_lm import stream_generate
@@ -60,6 +59,7 @@ from vllm_metal.stt.config import (
     STT_SCHED_BLOCK_BYTES,
     is_stt_model,
 )
+from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.serve import VLLMSTTRequestAdapter
 from vllm_metal.utils import get_model_download_path
 
@@ -580,172 +580,9 @@ def _extract_kv_cache(
     return extracted
 
 
-# ------------------------------------------------------------------
-# STTExecutor — owns audio feature extraction and decode delegation
-# ------------------------------------------------------------------
-
-
-class STTExecutor:
-    """Encapsulates STT-specific audio extraction and decoding.
-
-    Holds a lazily-created :class:`WhisperTranscriber` and provides
-    :meth:`extract_audio_features` and :meth:`decode` so that
-    :class:`MetalModelRunner` can delegate without STT-specific logic.
-    """
-
-    def __init__(self, model: Any, model_path: str) -> None:
-        self.model = model
-        self._model_path = model_path
-        self._transcriber: Any = None
-        self._model_type: str = getattr(model, "model_type", "whisper")
-        # Cached Qwen3-ASR special token IDs (resolved once on first use)
-        self._asr_text_token_id: int | None = None
-        self._im_end_token_id: int | None = None
-
-    @property
-    def transcriber(self):
-        """Lazily-created transcriber (Whisper or Qwen3-ASR)."""
-        if self._transcriber is None:
-            if self._model_type == "qwen3_asr":
-                from vllm_metal.stt.transcribe import Qwen3ASRTranscriber
-
-                self._transcriber = Qwen3ASRTranscriber(
-                    self.model, model_path=self._model_path
-                )
-            else:
-                from vllm_metal.stt.transcribe import WhisperTranscriber
-
-                self._transcriber = WhisperTranscriber(
-                    self.model, model_path=self._model_path
-                )
-        return self._transcriber
-
-    @property
-    def eot_token(self) -> int:
-        """End-of-text token ID resolved from the tokenizer or config."""
-        if self._model_type == "qwen3_asr":
-            return self.model.config.eos_token_id
-        return self.transcriber.tokenizer.convert_tokens_to_ids("<|endoftext|>")
-
-    def extract_audio_features(self, input_features: Any) -> "mx.array":
-        """Extract and encode STT input features."""
-        # Convert to MLX array — handle numpy, torch, and lists
-        if isinstance(input_features, np.ndarray):
-            mel = mx.array(input_features, dtype=mx.float16)
-        elif isinstance(input_features, torch.Tensor):
-            # .cpu() for device safety, .float() because bfloat16 has
-            # no numpy dtype support.
-            mel = mx.array(input_features.cpu().float().numpy(), dtype=mx.float16)
-        else:
-            mel = mx.array(np.array(input_features), dtype=mx.float16)
-
-        if self._model_type == "qwen3_asr":
-            # Qwen3-ASR encoder expects: (n_mels, time) or (batch, n_mels, time)
-            # HF WhisperFeatureExtractor output shape is already (n_mels, time)
-            if mel.ndim == 3:
-                mel = mel[0]  # drop batch dim → (n_mels, time)
-            elif mel.ndim != 2:
-                raise ValueError(f"Qwen3-ASR expects 2D or 3D mel, got rank {mel.ndim}")
-            features = self.model.encode(mel)
-            mx.eval(features)
-            return features
-        else:
-            # Whisper encoder expects: (batch, time, n_mels)
-            # HF WhisperFeatureExtractor output shape: (n_mels, time)
-            if mel.ndim == 2:
-                mel = mel[None, ...]  # add batch dim → (1, n_mels, time)
-                mel = mel.transpose(0, 2, 1)  # → (1, time, n_mels)
-            elif mel.ndim == 3:
-                mel = mel.transpose(
-                    0, 2, 1
-                )  # (batch, n_mels, time) → (batch, time, n_mels)
-            else:
-                raise ValueError(
-                    f"Unexpected mel spectrogram rank {mel.ndim}; expected 2D or 3D"
-                )
-
-            features = self.model.encode(mel)
-            mx.eval(features)
-            return features
-
-    def decode(
-        self,
-        audio_features: "mx.array",
-        prompt_token_ids: list[int],
-    ) -> list[int]:
-        """Decode audio features into token IDs (ending with EOT).
-
-        Delegates the core decode loop to the transcriber.
-
-        Args:
-            audio_features: Encoded audio from the encoder.
-            prompt_token_ids: Prefix tokens (language, task, etc.).
-
-        Returns:
-            List of decoded token IDs ending with EOT.
-        """
-        eot = self.eot_token
-
-        if self._model_type == "qwen3_asr":
-            # Qwen3-ASR uses a fixed prompt format — language, task, and
-            # user prompt controls are not supported by this model.
-            # Rebuild prompt with the correct number of audio_pad tokens
-            # matching the audio encoder output length.
-            n_audio_frames = audio_features.shape[0]
-            prompt_token_ids = self.transcriber.build_prompt_tokens(n_audio_frames)
-        elif not prompt_token_ids:
-            logger.warning("STT: empty prompt_token_ids, returning EOT")
-            return [eot]
-
-        tokens = self.transcriber.greedy_decode_tokens(audio_features, prompt_token_ids)
-
-        if self._model_type == "qwen3_asr":
-            # Extract tokens between <asr_text> and <|im_end|>
-            tokens = self._extract_asr_text_tokens(tokens)
-
-        # Always end with EOT so vLLM marks the request as finished
-        tokens.append(eot)
-        return tokens
-
-    def _extract_asr_text_tokens(self, tokens: list[int]) -> list[int]:
-        """Extract content tokens between <asr_text> and <|im_end|>.
-
-        Qwen3-ASR outputs: ``language {lang}<asr_text>{text}<|im_end|>``
-        We extract only the ``{text}`` portion.
-        """
-        if self._asr_text_token_id is None:
-            tok = self.transcriber.tokenizer
-            self._asr_text_token_id = tok.encode(
-                "<asr_text>", add_special_tokens=False
-            )[0]
-            self._im_end_token_id = tok.encode("<|im_end|>", add_special_tokens=False)[
-                0
-            ]
-        asr_text_token = self._asr_text_token_id
-        im_end_token = self._im_end_token_id
-
-        # Find last <asr_text> tag
-        start = -1
-        for i, t in enumerate(tokens):
-            if t == asr_text_token:
-                start = i + 1
-
-        if start < 0 or start >= len(tokens):
-            return tokens  # No <asr_text> found; return as-is
-
-        # Find first <|im_end|> after <asr_text>
-        end = len(tokens)
-        for i in range(start, len(tokens)):
-            if tokens[i] == im_end_token:
-                end = i
-                break
-
-        return tokens[start:end]
-
-
-# Cap total packed-prefill tokens per forward pass to bound activation
-# memory (QKV projections + FFN intermediates scale linearly with total
-# tokens) and avoid Metal GPU command-buffer timeouts on large dispatches.
+# SCAFFOLDING: remove when varlen kernel is ready.
+# Cap total packed-prefill tokens to bound the O(N²) dense causal mask.
+# Batches exceeding this limit are split into multiple forward passes.
 MAX_PACKED_PREFILL_TOKENS = 4096
 
 
@@ -780,7 +617,9 @@ class MetalModelRunner:
         self.model_args: dict[str, Any] = {}
         self._is_vlm: bool = False  # Will be set during model loading
         self._is_stt: bool = False  # Will be set during model loading
-        self._stt_executor: STTExecutor | None = None  # Set during STT loading
+        self._stt_runtime_adapter: STTRuntimeAdapter | None = (
+            None  # Set during STT loading
+        )
 
         # Request state cache for incremental decoding
         self._request_states: dict[str, RequestState] = {}
@@ -911,16 +750,19 @@ class MetalModelRunner:
                 )
                 self.tokenizer = None  # Whisper manages its own tokenizer
                 self._is_stt = True
-                self._stt_executor = STTExecutor(self.model, model_name)
+                self._stt_runtime_adapter = self.model.create_runtime_adapter(
+                    model_name
+                )
                 return
 
-        from vllm_metal.stt.transcribe import load_model as stt_load_model
+        # Local import: keep non-STT startup/import path light.
+        from vllm_metal.stt.loader import load_model as stt_load_model
 
         logger.info(f"Loading STT model: {model_name}")
         self.model = stt_load_model(model_name)
         self.tokenizer = None  # Whisper manages its own tokenizer
         self._is_stt = True
-        self._stt_executor = STTExecutor(self.model, model_name)
+        self._stt_runtime_adapter = self.model.create_runtime_adapter(model_name)
 
         with _model_cache_lock:
             _model_cache[model_name] = (self.model, None)
@@ -1044,7 +886,7 @@ class MetalModelRunner:
             Dictionary mapping attention layer names to KV cache specs
         """
         if self._is_stt:
-            # Whisper manages its own KV cache internally.
+            # STT models manage their own KV cache internally.
             # vLLM requires a non-empty spec for scheduler initialization,
             # so we return a single minimal entry.
             return {
@@ -1127,18 +969,9 @@ class MetalModelRunner:
             return
 
         if self._is_stt:
-            assert self._stt_executor is not None
+            assert self._stt_runtime_adapter is not None
             logger.info("Warming up STT model...")
-            n_mels = self.model.config.n_mels
-            n_audio_ctx = self.model.config.n_audio_ctx
-            if self._stt_executor._model_type == "qwen3_asr":
-                # Qwen3-ASR encoder expects (n_mels, time)
-                dummy_mel = mx.zeros((n_mels, n_audio_ctx * 2), dtype=mx.float16)
-            else:
-                # Whisper encoder expects (batch, time, n_mels)
-                dummy_mel = mx.zeros((1, n_audio_ctx * 2, n_mels), dtype=mx.float16)
-            features = self.model.encode(dummy_mel)
-            mx.eval(features)
+            self._stt_runtime_adapter.warm_up()
             logger.info("STT model warm-up complete")
             return
 
@@ -2286,13 +2119,13 @@ class MetalModelRunner:
         Raises:
             ValueError: If a request uses non-greedy sampling params.
         """
-        assert self._stt_executor is not None
+        assert self._stt_runtime_adapter is not None
 
         req_ids: list[str] = []
         req_id_to_index: dict[str, int] = {}
         sampled_tokens: list[list[int]] = []
 
-        eot_token = self._stt_executor.eot_token
+        eot_token = self._stt_runtime_adapter.eot_token
 
         for new_req in scheduler_output.scheduled_new_reqs:
             stt_request = VLLMSTTRequestAdapter.from_vllm_request(new_req)
@@ -2305,10 +2138,10 @@ class MetalModelRunner:
                     f"Got temperature={sampling_params.temperature}"
                 )
 
-            audio_features = self._stt_executor.extract_audio_features(
+            audio_features = self._stt_runtime_adapter.extract_audio_features(
                 stt_request.input_features
             )
-            tokens = self._stt_executor.decode(
+            tokens = self._stt_runtime_adapter.decode_tokens(
                 audio_features, list(stt_request.prompt_token_ids)
             )
 
